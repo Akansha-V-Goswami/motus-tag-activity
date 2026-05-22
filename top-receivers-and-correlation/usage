@@ -1,0 +1,29 @@
+Input: data file
+Export:  PDF plots, 
+        Excel workbook with:
+          - master summary sheet
+          - monthly sheets
+
+"proximity_flag": abs(r_pearson) > R_FLAG_THRESHOLD or abs(r_spearman) > R_FLAG_THRESHOLD,
+          R_FLAG_THRESHOLD = 0.5 
+
+5 minute bins 
+
+50% coverage 
+
+tag_id = Motus tag ID
+receiver = Receiver/station name
+month = Year-month
+n_bins = Number of valid daytime 5-min bins
+mean_sig = Mean signal strength across bins
+mean_bin_std = Mean within-bin signal standard deviation
+r_pearson = Pearson correlation between mean signal and std dev (parametric) 
+r_squared_pearson = Pearson (r^2)
+r_spearman = Spearman rank correlation
+divergence = Absolute difference between Pearson and Spearman
+slope = OLS regression slope
+intercept = OLS regression intercept
+Proximity_flag = if correlation is too high (TRUE) 
+Coverage pct = fraction of the month that had valid bins
+
+
