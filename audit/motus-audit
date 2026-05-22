@@ -1,0 +1,210 @@
+
+import argparse
+import pandas as pd
+
+# CONFIG
+DEFAULT_FILE = r"C:\Users\goswa\OneDrive\Desktop\longer_sample_data.parquet"
+LOCAL_TZ = "America/Jamaica"
+
+REQUIRED_COLUMNS = [
+    "motusTagID",
+    "datetime",
+    "recvDeployName"
+]
+
+
+# AUDIT FUNCTION
+def audit(parquet_path: str,
+          local_tz: str = LOCAL_TZ) -> pd.DataFrame:
+
+    print("\nLoading parquet file:")
+    print(f"  {parquet_path}")
+
+    # READ ONLY REQUIRED COLUMNS
+    df = pd.read_parquet(
+        parquet_path,
+        columns=REQUIRED_COLUMNS,
+        engine="pyarrow"
+    )
+
+    print(f"\nLoaded {len(df):,} detections")
+
+    # MEMORY OPTIMIZATION
+    print("Optimizing datatypes...")
+
+    df["motusTagID"] = df["motusTagID"].astype("category")
+    df["recvDeployName"] = df["recvDeployName"].astype("category")
+
+    # Efficient datetime parsing
+    df["datetime"] = pd.to_datetime(
+        df["datetime"],
+        utc=True,
+        errors="coerce"
+    )
+
+    # Remove invalid rows
+    df = df.dropna(subset=["motusTagID", "datetime"])
+
+    print(f"Found {df['motusTagID'].nunique():,} unique tag IDs")
+
+    
+    #  GROUPBY
+    print("\nComputing summaries...")
+
+    summary = (
+        df.groupby("motusTagID", observed=True)
+        .agg(
+            n_detections=("motusTagID", "size"),
+
+            first_detection=("datetime", "min"),
+
+            last_detection=("datetime", "max"),
+
+            receivers=(
+                "recvDeployName",
+                lambda x: sorted(set(x.dropna()))
+            )
+        )
+        .reset_index()
+    )
+
+    #  DAY CALCULATION
+    summary["n_days"] = (
+        (
+            summary["last_detection"].values.astype("datetime64[D]")
+            - summary["first_detection"].values.astype("datetime64[D]")
+        ).astype(int) + 1
+    )
+
+    # Number of receivers
+    summary["n_receivers"] = summary["receivers"].str.len()
+
+    
+    # TIMEZONE CONVERSION
+    
+    summary["first_detection"] = (
+        summary["first_detection"]
+        .dt.tz_convert(local_tz)
+        .dt.strftime("%Y-%m-%d")
+    )
+
+    summary["last_detection"] = (
+        summary["last_detection"]
+        .dt.tz_convert(local_tz)
+        .dt.strftime("%Y-%m-%d")
+    )
+
+    # Convert receiver lists to strings ONLY at end
+    summary["receivers"] = summary["receivers"].apply(
+        lambda x: ", ".join(map(str, x))
+    )
+
+    # Sort by tag ID
+    summary = summary.sort_values("motusTagID")
+
+    print("Audit complete.\n")
+
+    return summary
+
+
+# PRINT SUMMARY
+def print_summary(summary: pd.DataFrame) -> None:
+
+    print("=" * 80)
+    print(f"{'RAW DATA AUDIT':^80}")
+    print("=" * 80)
+
+    print(f"{'Tag IDs found:':<20} {len(summary):,}")
+    print(f"{'Total detections:':<20} {summary['n_detections'].sum():,}")
+    print(f"{'Dataset start:':<20} {summary['first_detection'].min()}")
+    print(f"{'Dataset end:':<20} {summary['last_detection'].max()}")
+
+    print("=" * 80)
+
+    # Faster than iterrows()
+    for row in summary.itertuples(index=False):
+
+        print(f"\nTag ID:       {row.motusTagID}")
+
+        print(f"  Detections: {row.n_detections:,}")
+
+        print(
+            f"  Date range: "
+            f"{row.first_detection} → {row.last_detection} "
+            f"({row.n_days} days)"
+        )
+
+        print(f"  Receivers ({row.n_receivers}):")
+
+        for recv in row.receivers.split(", "):
+            print(f"    - {recv}")
+
+    print("\n" + "=" * 80)
+
+    # Efficient receiver aggregation
+    all_receivers = set()
+
+    for receivers in summary["receivers"]:
+        all_receivers.update(receivers.split(", "))
+
+    print("All receivers across dataset:")
+
+    for recv in sorted(all_receivers):
+        print(f"  - {recv}")
+
+    print("=" * 80)
+
+
+# MAIN
+def main():
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Efficiently audit large Motus parquet files."
+        )
+    )
+
+    parser.add_argument(
+        "--file",
+        "-f",
+        default=DEFAULT_FILE,
+        help="Path to parquet file"
+    )
+
+    parser.add_argument(
+        "--out",
+        "-o",
+        default=None,
+        help="Optional output CSV path"
+    )
+
+    parser.add_argument(
+        "--tz",
+        default=LOCAL_TZ,
+        help="Timezone for display"
+    )
+
+    args = parser.parse_args()
+
+    summary = audit(
+        parquet_path=args.file,
+        local_tz=args.tz
+    )
+
+    print_summary(summary)
+
+    # Optional CSV export
+    if args.out:
+
+        summary.to_csv(
+            args.out,
+            index=False
+        )
+
+        print("\nSummary saved to:")
+        print(f"  {args.out}")
+
+
+# ENTRY POINT
+if __name__ == "__main__":
+    main()
