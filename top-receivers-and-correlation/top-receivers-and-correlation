@@ -1,0 +1,734 @@
+
+import argparse
+import warnings
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import pvlib
+
+from matplotlib.backends.backend_pdf import PdfPages
+
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+# CONFIG
+
+DEFAULT_FILE = r"C:\Users\goswa\OneDrive\Desktop\longer_sample_data.parquet"
+
+LOCAL_TZ = "America/Jamaica"
+
+LATITUDE = 18.1096
+LONGITUDE = -77.2975
+
+BIN_SIZE = "5min"
+
+MIN_READINGS_PER_BIN = 7
+
+SOLAR_THRESHOLD = -12
+
+R_FLAG_THRESHOLD = 0.5
+
+OUTPUT_PDF = "receiver_proximity_validation.pdf"
+
+OUTPUT_EXCEL = "receiver_proximity_summary.xlsx"
+
+REQUIRED_COLUMNS = [
+    "motusTagID",
+    "recvDeployName",
+    "datetime",
+    "sig",
+]
+
+# COLORS
+
+COLORS = {
+    "ok": "#2196F3",
+    "flagged": "#F44336",
+    "line": "#FF9800",
+}
+
+# LOAD + PREPROCESS
+
+def load_and_prepare_data(
+    parquet_path,
+    start=None,
+    end=None,
+):
+
+    print("\nLoading parquet:")
+    print(f"  {parquet_path}")
+
+    df = pd.read_parquet(
+        parquet_path,
+        columns=REQUIRED_COLUMNS,
+        engine="pyarrow"
+    )
+
+    print(f"\nLoaded {len(df):,} detections")
+
+    # OPTIMIZE DTYPES
+
+    print("Optimizing datatypes...")
+
+    df["motusTagID"] = (
+        df["motusTagID"]
+        .astype("category")
+    )
+
+    df["recvDeployName"] = (
+        df["recvDeployName"]
+        .astype("category")
+    )
+
+    df["sig"] = (
+        df["sig"]
+        .astype("float32")
+    )
+
+    # DATETIME
+
+    df["datetime"] = pd.to_datetime(
+        df["datetime"],
+        utc=True,
+        errors="coerce"
+    )
+
+    df = df.dropna(subset=[
+        "motusTagID",
+        "recvDeployName",
+        "datetime",
+        "sig",
+    ])
+
+    # OPTIONAL DATE FILTERING
+
+    if start:
+        start_ts = pd.Timestamp(start, tz="UTC")
+        df = df[df["datetime"] >= start_ts]
+
+    if end:
+        end_ts = pd.Timestamp(end, tz="UTC")
+        df = df[df["datetime"] <= end_ts]
+
+    print(f"Remaining detections: {len(df):,}")
+
+    # TIME BINS
+
+    print("\nCreating time bins...")
+
+    df["time_bin"] = (
+        df["datetime"]
+        .dt.floor(BIN_SIZE)
+    )
+
+    # SOLAR ELEVATION
+
+    print("Computing solar elevation...")
+
+    unique_bins = pd.DataFrame({
+        "time_bin": df["time_bin"].unique()
+    })
+
+    unique_bins["solar_elevation"] = (
+        pvlib.solarposition.get_solarposition(
+            time=unique_bins["time_bin"],
+            latitude=LATITUDE,
+            longitude=LONGITUDE,
+        )["apparent_elevation"]
+        .astype("float32")
+        .values
+    )
+
+    df = df.merge(
+        unique_bins,
+        on="time_bin",
+        how="left"
+    )
+
+    return df
+
+
+# GLOBAL BIN AGGREGATION
+
+def compute_global_bin_stats(df):
+
+    print("\nComputing global bin statistics...")
+
+    grouped = (
+        df.groupby(
+            [
+                "motusTagID",
+                "recvDeployName",
+                "time_bin",
+            ],
+            observed=True
+        )
+        .agg(
+            n_readings=("sig", "size"),
+
+            mean_signal=("sig", "mean"),
+
+            std_dev=("sig", "std"),
+
+            solar_elevation=("solar_elevation", "mean"),
+        )
+        .reset_index()
+    )
+
+    grouped = grouped[
+        grouped["n_readings"] >= MIN_READINGS_PER_BIN
+    ]
+
+    grouped = grouped.dropna(subset=["std_dev"])
+
+    grouped["month"] = (
+        grouped["time_bin"]
+        .dt.tz_localize(None)
+        .dt.to_period("M")
+        .astype(str)
+    )
+
+    print(f"Valid bins: {len(grouped):,}")
+
+    return grouped
+
+
+# RECEIVER PROXIMITY STATS
+
+def receiver_proximity_stats(bin_stats):
+
+    if len(bin_stats) < 5:
+        return {
+            "n_bins": len(bin_stats),
+            "mean_sig": np.nan,
+            "mean_bin_std": np.nan,
+            "r_pearson": np.nan,
+            "r_spearman": np.nan,
+            "slope": np.nan,
+            "intercept": np.nan,
+            "proximity_flag": False,
+        }
+
+    x = bin_stats["mean_signal"]
+
+    y = bin_stats["std_dev"]
+
+    r_pearson = x.corr(
+        y,
+        method="pearson"
+    )
+
+    r_spearman = x.corr(
+        y,
+        method="spearman"
+    )
+
+    slope, intercept = np.polyfit(x, y, 1)
+
+    return {
+        "n_bins": len(bin_stats),
+
+        "mean_sig": round(x.mean(), 2),
+
+        "mean_bin_std": round(y.mean(), 2),
+
+        "r_pearson": round(r_pearson, 3),
+
+        "r_spearman": round(r_spearman, 3),
+
+        "slope": round(slope, 4),
+
+        "intercept": round(intercept, 4),
+
+        "proximity_flag": (
+            abs(r_pearson) > R_FLAG_THRESHOLD
+            or
+            abs(r_spearman) > R_FLAG_THRESHOLD
+        ),
+    }
+
+
+# PLOTTING
+
+def plot_receiver_scatter(
+    ax,
+    bin_stats,
+    stats,
+    receiver,
+):
+
+    color = (
+        COLORS["flagged"]
+        if stats["proximity_flag"]
+        else COLORS["ok"]
+    )
+
+    ax.scatter(
+        bin_stats["mean_signal"],
+        bin_stats["std_dev"],
+        s=18,
+        alpha=0.45,
+        color=color,
+    )
+
+    if not np.isnan(stats["slope"]):
+
+        x_line = np.linspace(
+            bin_stats["mean_signal"].min(),
+            bin_stats["mean_signal"].max(),
+            100
+        )
+
+        y_line = (
+            stats["slope"] * x_line
+            + stats["intercept"]
+        )
+
+        ax.plot(
+            x_line,
+            y_line,
+            color=COLORS["line"],
+            linewidth=1.8
+        )
+
+    flag_label = (
+        "⚠ FLAGGED"
+        if stats["proximity_flag"]
+        else "✓ OK"
+    )
+
+    ax.set_title(
+        f"{receiver}\n"
+        f"r={stats['r_pearson']:.3f}  "
+        f"ρ={stats['r_spearman']:.3f}  "
+        f"{flag_label}",
+        fontsize=9
+    )
+
+    ax.set_xlabel("Mean Signal")
+
+    ax.set_ylabel("Signal Std Dev")
+
+    ax.grid(alpha=0.3)
+
+
+# MAIN
+
+def run(
+    parquet_path,
+    tag_id=None,
+    start=None,
+    end=None,
+):
+
+    # LOAD DATA
+
+    df = load_and_prepare_data(
+        parquet_path,
+        start=start,
+        end=end,
+    )
+
+    if tag_id is not None:
+        df = df[df["motusTagID"] == tag_id]
+
+    # GLOBAL AGGREGATION
+
+    bin_stats_all = compute_global_bin_stats(df)
+
+    # Daytime only
+    bin_stats_all = bin_stats_all[
+        bin_stats_all["solar_elevation"] > SOLAR_THRESHOLD
+    ]
+
+    print(f"Daytime bins: {len(bin_stats_all):,}")
+
+    # SUMMARY BUILD
+
+    summary_records = []
+
+    receiver_cache = {}
+
+    print("\nComputing receiver statistics...")
+
+    for (tid, month), tag_month_df in bin_stats_all.groupby(
+        ["motusTagID", "month"],
+        observed=True
+    ):
+
+        receiver_stats = []
+
+        for receiver, receiver_bins in tag_month_df.groupby(
+            "recvDeployName",
+            observed=True
+        ):
+
+            stats = receiver_proximity_stats(
+                receiver_bins
+            )
+
+            total_readings = int(
+                receiver_bins["n_readings"].sum()
+            )
+
+            total_valid_bins = int(
+                len(receiver_bins)
+            )
+
+            month_start = pd.Timestamp(month)
+
+            month_end = (
+                month_start
+                + pd.offsets.MonthEnd(1)
+            )
+
+            total_possible_bins = int(
+                (month_end - month_start).total_seconds() / 300
+            ) + 1
+
+            coverage_pct = (
+                100
+                * total_valid_bins
+                / total_possible_bins
+            )
+
+            stats.update({
+                "tag_id": tid,
+                "month": month,
+                "receiver": receiver,
+                "total_readings": total_readings,
+                "total_valid_bins": total_valid_bins,
+                "coverage_pct": round(coverage_pct, 2),
+            })
+
+            receiver_stats.append(stats)
+
+            receiver_cache[(tid, receiver)] = receiver_bins
+
+        recv_df = pd.DataFrame(receiver_stats)
+
+        if recv_df.empty:
+            continue
+
+        # TOP 3 RANKINGS
+
+        top3_readings = (
+            recv_df
+            .nlargest(3, "total_readings")["receiver"]
+            .tolist()
+        )
+
+        top3_bins = (
+            recv_df
+            .nlargest(3, "total_valid_bins")["receiver"]
+            .tolist()
+        )
+
+        for _, row in recv_df.iterrows():
+
+            in_readings = (
+                row["receiver"]
+                in top3_readings
+            )
+
+            in_bins = (
+                row["receiver"]
+                in top3_bins
+            )
+
+            if not (in_readings or in_bins):
+                continue
+
+            if in_readings and in_bins:
+                ranked_by = "both"
+
+            elif in_readings:
+                ranked_by = "total_readings"
+
+            else:
+                ranked_by = "total_bins"
+
+            row_dict = row.to_dict()
+
+            row_dict["ranked_by"] = ranked_by
+
+            summary_records.append(row_dict)
+
+            flag = (
+                "⚠ FLAGGED"
+                if row["proximity_flag"]
+                else "OK"
+            )
+
+            print(
+                f"Tag {tid:<8} "
+                f"{str(receiver):<30} "
+                f"r={row['r_pearson']:>7.3f}  "
+                f"ρ={row['r_spearman']:>7.3f}  "
+                f"{flag}"
+            )
+
+    summary_df = pd.DataFrame(summary_records)
+
+    # DERIVED METRICS
+
+    summary_df["r_squared_pearson"] = (
+        summary_df["r_pearson"] ** 2
+    )
+
+    summary_df["divergence"] = (
+        summary_df["r_pearson"]
+        - summary_df["r_spearman"]
+    ).abs()
+
+    # PDF OUTPUT
+
+    print("\nGenerating PDF...")
+
+    with PdfPages(OUTPUT_PDF) as pdf:
+
+        for tid in summary_df["tag_id"].unique():
+
+            tag_summary = (
+                summary_df[
+                    summary_df["tag_id"] == tid
+                ]
+            )
+
+            n_recv = len(tag_summary)
+
+            ncols = min(3, n_recv)
+
+            nrows = int(np.ceil(n_recv / ncols))
+
+            fig, axes = plt.subplots(
+                nrows,
+                ncols,
+                figsize=(6 * ncols, 4.5 * nrows),
+                squeeze=False,
+            )
+
+            fig.suptitle(
+                f"Receiver Proximity Validation — Tag {tid}",
+                fontsize=12,
+                fontweight="bold"
+            )
+
+            for idx, row in enumerate(
+                tag_summary.itertuples(index=False)
+            ):
+
+                r, c = divmod(idx, ncols)
+
+                ax = axes[r][c]
+
+                receiver_bins = receiver_cache[
+                    (row.tag_id, row.receiver)
+                ]
+
+                plot_receiver_scatter(
+                    ax=ax,
+                    bin_stats=receiver_bins,
+                    stats=row._asdict(),
+                    receiver=row.receiver,
+                )
+
+            for idx in range(
+                len(tag_summary),
+                nrows * ncols
+            ):
+                r, c = divmod(idx, ncols)
+                axes[r][c].set_visible(False)
+
+            plt.tight_layout()
+
+            pdf.savefig(fig, bbox_inches="tight")
+
+            plt.close(fig)
+
+    print(f"\nPDF saved:")
+    print(f"  {OUTPUT_PDF}")
+
+    # EXCEL EXPORT
+
+    print(f"\nSaving Excel:")
+    print(f"  {OUTPUT_EXCEL}")
+
+    desired_cols = [
+
+        # IDs
+        "tag_id",
+        "month",
+        "receiver",
+        "ranked_by",
+
+        # Ranking metrics
+        "total_readings",
+        "total_valid_bins",
+        "coverage_pct",
+
+        # Correlations
+        "r_pearson",
+        "r_squared_pearson",
+        "r_spearman",
+        "divergence",
+
+        # Signal metrics
+        "mean_sig",
+        "mean_bin_std",
+
+        # Regression
+        "slope",
+        "intercept",
+
+        # QC
+        "proximity_flag",
+    ]
+
+    summary_df = summary_df[desired_cols]
+
+    with pd.ExcelWriter(
+        OUTPUT_EXCEL,
+        engine="openpyxl"
+    ) as writer:
+
+        # MASTER SHEET
+
+        summary_df.to_excel(
+            writer,
+            sheet_name="summary",
+            index=False
+        )
+
+        # MONTHLY SHEETS
+
+        for month in sorted(
+            summary_df["month"].unique()
+        ):
+
+            month_df = summary_df[
+                summary_df["month"] == month
+            ]
+
+            sheet_name = str(month)[:31]
+
+            month_df.to_excel(
+                writer,
+                sheet_name=sheet_name,
+                index=False
+            )
+
+        # FORMAT SHEETS
+
+        for sheet_name in writer.sheets:
+
+            worksheet = writer.sheets[sheet_name]
+
+            worksheet.freeze_panes = "A2"
+
+            for column_cells in worksheet.columns:
+
+                max_length = max(
+                    len(str(cell.value))
+                    if cell.value is not None else 0
+                    for cell in column_cells
+                )
+
+                adjusted_width = min(
+                    max_length + 4,
+                    40
+                )
+
+                worksheet.column_dimensions[
+                    column_cells[0].column_letter
+                ].width = adjusted_width
+
+    print(f"\nExcel saved:")
+    print(f"  {OUTPUT_EXCEL}")
+
+    # FINAL SUMMARY
+
+    print(f"\n{'='*80}")
+    print("FULL SUMMARY")
+    print(f"{'='*80}")
+
+    print(
+        summary_df.to_string(
+            index=False,
+            float_format=lambda x: f"{x:.3f}"
+        )
+    )
+
+    flagged = summary_df[
+        summary_df["proximity_flag"]
+    ]
+
+    print(f"\nFlagged receivers:")
+
+    if flagged.empty:
+        print("  None")
+
+    else:
+
+        for row in flagged.itertuples(index=False):
+
+            print(
+                f"  Tag {row.tag_id} | "
+                f"{row.receiver} | "
+                f"r={row.r_pearson:.3f} "
+                f"ρ={row.r_spearman:.3f}"
+            )
+
+    print("\nDone.")
+
+    return summary_df
+
+
+# CLI
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "High-performance receiver "
+            "proximity validation."
+        )
+    )
+
+    parser.add_argument(
+        "--file",
+        "-f",
+        default=DEFAULT_FILE,
+        help="Path to parquet file"
+    )
+
+    parser.add_argument(
+        "--tag",
+        "-t",
+        type=int,
+        default=None,
+        help="Single tag ID"
+    )
+
+    parser.add_argument(
+        "--start",
+        "-s",
+        default=None,
+        help="Start date YYYY-MM-DD"
+    )
+
+    parser.add_argument(
+        "--end",
+        "-e",
+        default=None,
+        help="End date YYYY-MM-DD"
+    )
+
+    args = parser.parse_args()
+
+    run(
+        parquet_path=args.file,
+        tag_id=args.tag,
+        start=args.start,
+        end=args.end,
+    )
