@@ -1,0 +1,9 @@
+Inputs: motus data file (PARQUET)
+Outputs:  list of tag IDs, receivers, detections, and time frame
+Optimizations:
+- Reads only required columns
+- Vectorized groupby operations
+- No dataframe filtering loops
+- Categorical dtypes for memory efficiency
+- Efficient datetime handling
+- Uses itertuples() instead of iterrows()
