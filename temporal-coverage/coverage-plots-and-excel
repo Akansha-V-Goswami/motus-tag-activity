@@ -1,0 +1,666 @@
+
+
+# ============================================================
+# IMPORTS
+# ============================================================
+
+import argparse
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+from matplotlib.backends.backend_pdf import PdfPages
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+DEFAULT_PARQUET = (
+    r"C:\Users\goswa\OneDrive\Desktop\longer_sample_data.parquet"
+)
+
+DEFAULT_CORRELATION_EXCEL = (
+    r"C:\Users\goswa\PyCharmMiscProject\2\may26\receiver_proximity_summary.xlsx"
+)
+
+OUTPUT_EXCEL = "top3_daily_receivers.xlsx"
+
+OUTPUT_PDF = "receiver_transition_timelines.pdf"
+
+LOCAL_TZ = "America/Jamaica"
+
+REQUIRED_COLUMNS = [
+    "motusTagID",
+    "recvDeployName",
+    "datetime",
+]
+
+# ============================================================
+# LOAD FLAGGED RECEIVERS
+# ============================================================
+
+def load_flagged_receivers(excel_path):
+
+    print("\nLoading correlation Excel...")
+    print(f"  {excel_path}")
+
+    xls = pd.ExcelFile(excel_path)
+
+    all_sheets = []
+
+    for sheet in xls.sheet_names:
+
+        try:
+
+            df = pd.read_excel(
+                xls,
+                sheet_name=sheet
+            )
+
+            required_cols = {
+                "tag_id",
+                "receiver",
+                "month",
+                "proximity_flag"
+            }
+
+            if required_cols.issubset(df.columns):
+
+                all_sheets.append(df)
+
+        except Exception:
+            continue
+
+    if not all_sheets:
+
+        raise ValueError(
+            "No sheets found with required columns:\n"
+            "tag_id, receiver, month, proximity_flag"
+        )
+
+    corr_df = pd.concat(
+        all_sheets,
+        ignore_index=True
+    )
+
+    # --------------------------------------------------------
+    # KEEP ONLY FLAGGED MONTHS
+    # --------------------------------------------------------
+
+    flagged = (
+        corr_df[
+            corr_df["proximity_flag"] == True
+        ][[
+            "tag_id",
+            "receiver",
+            "month"
+        ]]
+        .drop_duplicates()
+    )
+
+    # Normalize types
+    flagged["month"] = (
+        flagged["month"]
+        .astype(str)
+    )
+
+    print(
+        f"Flagged tag/receiver/month combinations: "
+        f"{len(flagged):,}"
+    )
+
+    return flagged
+
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+def load_data(parquet_path):
+
+    print("\nLoading parquet...")
+    print(f"  {parquet_path}")
+
+    df = pd.read_parquet(
+        parquet_path,
+        columns=REQUIRED_COLUMNS,
+        engine="pyarrow"
+    )
+
+    print(f"Loaded {len(df):,} detections")
+
+    # --------------------------------------------------------
+    # MEMORY OPTIMIZATION
+    # --------------------------------------------------------
+
+    print("Optimizing dtypes...")
+
+    df["motusTagID"] = (
+        df["motusTagID"]
+        .astype("category")
+    )
+
+    df["recvDeployName"] = (
+        df["recvDeployName"]
+        .astype("category")
+    )
+
+    # --------------------------------------------------------
+    # DATETIME
+    # --------------------------------------------------------
+
+    print("Parsing datetime...")
+
+    df["datetime"] = pd.to_datetime(
+        df["datetime"],
+        utc=True,
+        errors="coerce"
+    )
+
+    df = df.dropna(subset=[
+        "motusTagID",
+        "recvDeployName",
+        "datetime"
+    ])
+
+    # --------------------------------------------------------
+    # TIMEZONE
+    # --------------------------------------------------------
+
+    df["datetime"] = (
+        df["datetime"]
+        .dt.tz_convert(LOCAL_TZ)
+    )
+
+    # --------------------------------------------------------
+    # DATE + MONTH
+    # --------------------------------------------------------
+
+    df["date"] = (
+        df["datetime"]
+        .dt.date
+    )
+
+    df["month"] = (
+        df["datetime"]
+        .dt.strftime("%Y-%m")
+    )
+
+    return df
+
+
+# ============================================================
+# COMPUTE DAILY TOP RECEIVERS
+# ============================================================
+
+def compute_top_receivers(
+    df,
+    flagged_receivers,
+):
+
+    print("\nComputing daily receiver totals...")
+
+    # --------------------------------------------------------
+    # DAILY COUNTS
+    # --------------------------------------------------------
+
+    counts = (
+        df.groupby(
+            [
+                "motusTagID",
+                "month",
+                "date",
+                "recvDeployName"
+            ],
+            observed=True
+        )
+        .size()
+        .reset_index(name="total_readings")
+    )
+
+    print(f"Daily receiver rows: {len(counts):,}")
+
+    # --------------------------------------------------------
+    # MONTH-SPECIFIC FLAGGING
+    # --------------------------------------------------------
+
+    print("\nApplying MONTH-SPECIFIC filtering...")
+
+    counts = counts.merge(
+
+        flagged_receivers.assign(
+            flagged_removed=True
+        ),
+
+        left_on=[
+            "motusTagID",
+            "recvDeployName",
+            "month"
+        ],
+
+        right_on=[
+            "tag_id",
+            "receiver",
+            "month"
+        ],
+
+        how="left"
+    )
+
+    counts["flagged_removed"] = (
+        counts["flagged_removed"]
+        .fillna(False)
+    )
+
+    removed_n = (
+        counts["flagged_removed"]
+        .sum()
+    )
+
+    print(
+        f"Removed {removed_n:,} "
+        f"flagged tag/receiver/month rows"
+    )
+
+    filtered = counts[
+        counts["flagged_removed"] == False
+    ].copy()
+
+    # --------------------------------------------------------
+    # DAILY TOTALS
+    # --------------------------------------------------------
+
+    daily_totals = (
+        filtered.groupby(
+            [
+                "motusTagID",
+                "date"
+            ],
+            observed=True
+        )["total_readings"]
+        .sum()
+        .reset_index(name="daily_total")
+    )
+
+    filtered = filtered.merge(
+        daily_totals,
+        on=[
+            "motusTagID",
+            "date"
+        ],
+        how="left"
+    )
+
+    filtered["pct_of_day"] = (
+        100
+        * filtered["total_readings"]
+        / filtered["daily_total"]
+    ).round(2)
+
+    # --------------------------------------------------------
+    # RANK RECEIVERS
+    # --------------------------------------------------------
+
+    filtered["receiver_rank"] = (
+
+        filtered.groupby(
+            [
+                "motusTagID",
+                "date"
+            ],
+            observed=True
+        )["total_readings"]
+
+        .rank(
+            method="first",
+            ascending=False
+        )
+    )
+
+    top3 = filtered[
+        filtered["receiver_rank"] <= 3
+    ].copy()
+
+    top3["receiver_rank"] = (
+        top3["receiver_rank"]
+        .astype(int)
+    )
+
+    top3 = top3.sort_values([
+        "motusTagID",
+        "date",
+        "receiver_rank"
+    ])
+
+    print(f"Top 3 rows retained: {len(top3):,}")
+
+    return top3
+
+# ─────────────────────────────────────────────
+# SAVE EXCEL
+# ─────────────────────────────────────────────
+def save_excel(export_df):
+
+    excel_output = OUTPUT_EXCEL
+
+    print(f"\nSaving Excel:")
+    print(f"  {excel_output}")
+
+    # ----------------------------------------------------
+    # REMOVE DUPLICATE COLUMNS
+    # ----------------------------------------------------
+    export_df = export_df.loc[
+        :,
+        ~export_df.columns.duplicated()
+    ].copy()
+
+    # ----------------------------------------------------
+    # FIX POSSIBLE DUPLICATE tag_id ISSUE
+    # ----------------------------------------------------
+    if isinstance(export_df["tag_id"], pd.DataFrame):
+
+        export_df["tag_id"] = (
+            export_df["tag_id"]
+            .iloc[:, 0]
+        )
+
+    with pd.ExcelWriter(
+        excel_output,
+        engine="openpyxl"
+    ) as writer:
+
+        # =================================================
+        # MASTER SHEET
+        # =================================================
+        export_df.to_excel(
+            writer,
+            sheet_name="ALL_DATA",
+            index=False
+        )
+
+        # =================================================
+        # ONE SHEET PER TAG
+        # =================================================
+        tag_ids = (
+            export_df["tag_id"]
+            .dropna()
+            .unique()
+        )
+
+        for tag_id in sorted(tag_ids):
+
+            tag_df = (
+                export_df[
+                    export_df["tag_id"] == tag_id
+                ]
+                .sort_values([
+                    "date",
+                    "rank"
+                ])
+                .copy()
+            )
+
+            sheet_name = f"Tag_{tag_id}"[:31]
+
+            print(f"  Writing: {sheet_name}")
+
+            tag_df.to_excel(
+                writer,
+                sheet_name=sheet_name,
+                index=False
+            )
+
+            worksheet = writer.sheets[sheet_name]
+
+            # Freeze header row
+            worksheet.freeze_panes = "A2"
+
+            # Auto-size columns
+            for column_cells in worksheet.columns:
+
+                max_length = max(
+                    len(str(cell.value))
+                    if cell.value is not None else 0
+                    for cell in column_cells
+                )
+
+                adjusted_width = min(
+                    max_length + 4,
+                    40
+                )
+
+                worksheet.column_dimensions[
+                    column_cells[0].column_letter
+                ].width = adjusted_width
+
+    print("\nExcel saved.")
+
+# ============================================================
+# PLOT TIMELINES
+# ============================================================
+
+def plot_timelines(top3):
+
+    print(f"\nGenerating PDF:")
+    print(f"  {OUTPUT_PDF}")
+
+    receivers = sorted(
+        top3["recvDeployName"]
+        .astype(str)
+        .unique()
+    )
+
+    cmap = plt.cm.get_cmap(
+        "tab20",
+        len(receivers)
+    )
+
+    receiver_colors = {
+        recv: cmap(i)
+        for i, recv in enumerate(receivers)
+    }
+
+    with PdfPages(OUTPUT_PDF) as pdf:
+
+        # ----------------------------------------------------
+        # LOOP TAGS
+        # ----------------------------------------------------
+
+        for tag_id in sorted(
+            top3["motusTagID"].unique()
+        ):
+
+            tag_df = top3[
+                top3["motusTagID"] == tag_id
+            ]
+
+            # ------------------------------------------------
+            # LOOP MONTHS
+            # ------------------------------------------------
+
+            for month in sorted(
+                tag_df["month"].unique()
+            ):
+
+                month_df = tag_df[
+                    tag_df["month"] == month
+                ]
+
+                if month_df.empty:
+                    continue
+
+                dates = sorted(
+                    month_df["date"].unique()
+                )
+
+                fig, ax = plt.subplots(
+                    figsize=(16, 5)
+                )
+
+                # --------------------------------------------
+                # DRAW RECEIVER BLOCKS
+                # --------------------------------------------
+
+                for _, row in month_df.iterrows():
+
+                    x = dates.index(row["date"])
+
+                    y = 4 - row["receiver_rank"]
+
+                    receiver = str(
+                        row["recvDeployName"]
+                    )
+
+                    color = receiver_colors[receiver]
+
+                    ax.bar(
+                        x,
+                        1,
+                        bottom=y,
+                        width=0.95,
+                        color=color,
+                        edgecolor="black",
+                        linewidth=0.3
+                    )
+
+                    ax.text(
+                        x,
+                        y + 0.5,
+                        receiver[:12],
+                        ha="center",
+                        va="center",
+                        fontsize=6,
+                        rotation=90
+                    )
+
+                # --------------------------------------------
+                # AXES
+                # --------------------------------------------
+
+                ax.set_xticks(
+                    range(len(dates))
+                )
+
+                ax.set_xticklabels(
+                    [str(d)[8:] for d in dates],
+                    fontsize=7
+                )
+
+                ax.set_yticks([1, 2, 3])
+
+                ax.set_yticklabels([
+                    "Top 3",
+                    "Top 2",
+                    "Top 1"
+                ])
+
+                ax.set_xlabel("Day of Month")
+
+                ax.set_ylabel("Receiver Rank")
+
+                ax.set_title(
+                    f"Receiver Dominance Timeline\n"
+                    f"Tag {tag_id} | {month}",
+                    fontsize=12,
+                    fontweight="bold"
+                )
+
+                # --------------------------------------------
+                # LEGEND
+                # --------------------------------------------
+
+                unique_receivers = sorted(
+                    month_df["recvDeployName"]
+                    .astype(str)
+                    .unique()
+                )
+
+                legend_handles = [
+
+                    mpatches.Patch(
+                        color=receiver_colors[r],
+                        label=r
+                    )
+
+                    for r in unique_receivers
+                ]
+
+                ax.legend(
+                    handles=legend_handles,
+                    bbox_to_anchor=(1.02, 1),
+                    loc="upper left",
+                    fontsize=7
+                )
+
+                plt.tight_layout()
+
+                pdf.savefig(fig)
+
+                plt.close(fig)
+
+    print("PDF saved.")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def run(
+    parquet_file,
+    excel_file,
+):
+
+    flagged_receivers = load_flagged_receivers(
+        excel_file
+    )
+
+    df = load_data(
+        parquet_file
+    )
+
+    top3 = compute_top_receivers(
+        df,
+        flagged_receivers
+    )
+
+    save_excel(top3)
+
+    plot_timelines(top3)
+
+    print("\nDone.")
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Top 3 daily receiver timelines "
+            "with MONTH-SPECIFIC filtering."
+        )
+    )
+
+    parser.add_argument(
+        "--file",
+        "-f",
+        default=DEFAULT_PARQUET,
+        help="Path to parquet file"
+    )
+
+    parser.add_argument(
+        "--excel",
+        "-e",
+        default=DEFAULT_CORRELATION_EXCEL,
+        help="Path to correlation summary Excel"
+    )
+
+    args = parser.parse_args()
+
+    run(
+        parquet_file=args.file,
+        excel_file=args.excel,
+    )
