@@ -1,0 +1,12 @@
+input: parquet and top receivers excel 
+output: daily top 3 receivers graph and excel 
+
+For each tag ID:
+    • Compute TOP 3 receivers PER DAY
+      ranked by TOTAL READINGS
+
+    • Remove ONLY receivers that are flagged
+      for THAT SPECIFIC MONTH
+
+    • Plot receiver dominance timelines
+      to visualize transitions between receivers
